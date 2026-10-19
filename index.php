@@ -1,0 +1,567 @@
+<?php
+// ==========================================
+// 1. DATABASE CONNECTION & AUTO-INSTALL
+// ==========================================
+require_once 'config.php';
+
+try {
+    $pdo = new PDO("mysql:host=".DB_HOST.";charset=utf8mb4", DB_USER, DB_PASS);
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    
+    // Auto create DB if not exists
+    $pdo->exec("CREATE DATABASE IF NOT EXISTS `".DB_NAME."` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+    $pdo->exec("USE `".DB_NAME."`");
+    
+    // Auto create tables if they don't exist
+    $pdo->exec("CREATE TABLE IF NOT EXISTS `users` (
+        `id` INT AUTO_INCREMENT PRIMARY KEY,
+        `name` VARCHAR(100) NOT NULL,
+        `email` VARCHAR(100) NOT NULL UNIQUE,
+        `phone` VARCHAR(20) NOT NULL,
+        `password` VARCHAR(255) NOT NULL,
+        `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )");
+    
+    $pdo->exec("CREATE TABLE IF NOT EXISTS `menu` (
+        `id` INT AUTO_INCREMENT PRIMARY KEY,
+        `name` VARCHAR(100) NOT NULL,
+        `description` TEXT,
+        `price` DECIMAL(10,2) NOT NULL,
+        `category` VARCHAR(50) NOT NULL,
+        `emoji` VARCHAR(10) DEFAULT '🍽️',
+        `stock` INT DEFAULT 50
+    )");
+    
+    $pdo->exec("CREATE TABLE IF NOT EXISTS `orders` (
+        `id` INT AUTO_INCREMENT PRIMARY KEY,
+        `order_code` VARCHAR(20) NOT NULL UNIQUE,
+        `user_id` INT DEFAULT NULL,
+        `guest_name` VARCHAR(100) DEFAULT NULL,
+        `items_json` TEXT NOT NULL,
+        `total` DECIMAL(10,2) NOT NULL,
+        `status` VARCHAR(20) DEFAULT 'Pending',
+        `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )");
+    
+    // Seed menu if empty
+    if ($pdo->query("SELECT COUNT(*) FROM `menu`")->fetchColumn() == 0) {
+        $pdo->exec("INSERT INTO `menu` (`name`, `description`, `price`, `category`, `emoji`, `stock`) VALUES
+        ('Espresso', 'Strong and bold', 90.00, 'Coffee', '☕', 40),
+        ('Cappuccino', 'Espresso with milk foam', 140.00, 'Coffee', '☕', 40),
+        ('Masala Chai', 'Indian spiced tea', 60.00, 'Tea', '🍵', 50),
+        ('Cold Coffee', 'Blended with ice cream', 150.00, 'Cold drinks', '🥤', 30),
+        ('Veg Sandwich', 'Grilled with chutney', 110.00, 'Snacks', '🥪', 25),
+        ('Peri Peri Fries', 'Crispy and spicy', 120.00, 'Snacks', '🍟', 25),
+        ('Brownie', 'Warm chocolate brownie', 130.00, 'Desserts', '🍫', 20),
+        ('Cheesecake', 'New York style', 180.00, 'Desserts', '🍰', 15)");
+    }
+} catch (PDOException $e) {
+    die("<h1 style='color:red;text-align:center;margin-top:50px;'>Database Error: " . $e->getMessage() . "</h1>");
+}
+
+session_start();
+
+// ==========================================
+// 2. API ROUTER
+// ==========================================
+if (isset($_GET['api'])) {
+    header('Content-Type: application/json');
+    $action = $_GET['api'];
+    $input = json_decode(file_get_contents('php://input'), true) ?? [];
+
+    // --- AUTHENTICATION ---
+    if ($action === 'signup') {
+        $name = trim($input['name'] ?? '');
+        $email = trim($input['email'] ?? '');
+        $phone = trim($input['phone'] ?? '');
+        $pass = $input['password'] ?? '';
+
+        if (!$name || !$email || !$phone || !$pass) {
+            echo json_encode(['error' => 'All fields are required']); exit;
+        }
+
+        $stmt = $pdo->prepare("SELECT id FROM users WHERE email = ?");
+        $stmt->execute([$email]);
+        if ($stmt->fetch()) {
+            echo json_encode(['error' => 'Email already registered']); exit;
+        }
+
+        $hash = password_hash($pass, PASSWORD_DEFAULT);
+        $stmt = $pdo->prepare("INSERT INTO users (name, email, phone, password) VALUES (?, ?, ?, ?)");
+        if ($stmt->execute([$name, $email, $phone, $hash])) {
+            $_SESSION['user'] = ['id' => $pdo->lastInsertId(), 'name' => $name, 'email' => $email];
+            echo json_encode(['success' => true, 'user' => $_SESSION['user']]);
+        } else {
+            echo json_encode(['error' => 'Registration failed']);
+        }
+        exit;
+    }
+
+    if ($action === 'login') {
+        $email = trim($input['email'] ?? '');
+        $pass = $input['password'] ?? '';
+
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ?");
+        $stmt->execute([$email]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($user && password_verify($pass, $user['password'])) {
+            $_SESSION['user'] = ['id' => $user['id'], 'name' => $user['name'], 'email' => $user['email']];
+            echo json_encode(['success' => true, 'user' => $_SESSION['user']]);
+        } else {
+            echo json_encode(['error' => 'Invalid email or password']);
+        }
+        exit;
+    }
+
+    if ($action === 'logout') {
+        session_destroy();
+        echo json_encode(['success' => true]); exit;
+    }
+
+    if ($action === 'me') {
+        echo json_encode(['user' => $_SESSION['user'] ?? null]); exit;
+    }
+
+    // --- MENU ---
+    if ($action === 'menu') {
+        $items = $pdo->query("SELECT * FROM menu")->fetchAll(PDO::FETCH_ASSOC);
+        echo json_encode(['items' => $items]); exit;
+    }
+
+    // --- CHECKOUT ---
+    if ($action === 'checkout') {
+        $cart = $input['cart'] ?? [];
+        $total = $input['total'] ?? 0;
+        $guestName = $input['guest_name'] ?? 'Guest';
+        $userId = $_SESSION['user']['id'] ?? null;
+        $code = 'ENC-' . rand(1000, 9999);
+
+        if (empty($cart)) {
+            echo json_encode(['error' => 'Cart is empty']); exit;
+        }
+
+        $stmt = $pdo->prepare("INSERT INTO orders (order_code, user_id, guest_name, items_json, total) VALUES (?, ?, ?, ?, ?)");
+        if ($stmt->execute([$code, $userId, $guestName, json_encode($cart), $total])) {
+            echo json_encode(['success' => true, 'order_code' => $code]);
+        } else {
+            echo json_encode(['error' => 'Failed to create order']);
+        }
+        exit;
+    }
+    
+    exit;
+}
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Encave Café</title>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@700;800&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+    /* CSS DESIGN SYSTEM */
+    :root {
+        --bg: #F2F4FF; --card: #FFFFFF; --ink: #10132B; --mute: #5B6085;
+        --pri: #2F4BFF; --accent: #FFD23F; --danger: #FF4D4D;
+        --border: 2px solid #10132B; --shadow: 4px 4px 0 #10132B;
+        --font-main: 'DM Sans', sans-serif; --font-title: 'Bricolage Grotesque', sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+        background-color: var(--bg); color: var(--ink); font-family: var(--font-main);
+        background-image: radial-gradient(#DADEF3 1.5px, transparent 1.5px);
+        background-size: 24px 24px; min-height: 100vh;
+    }
+    h1, h2, h3 { font-family: var(--font-title); }
+    
+    /* NAVBAR */
+    header {
+        background: var(--card); border-bottom: var(--border);
+        padding: 16px 24px; display: flex; justify-content: space-between; align-items: center;
+        position: sticky; top: 0; z-index: 100;
+    }
+    .logo { font-size: 24px; font-weight: 800; display: flex; align-items: center; gap: 10px; }
+    nav { display: flex; gap: 12px; align-items: center; }
+    .btn {
+        background: var(--accent); color: var(--ink); border: var(--border);
+        padding: 10px 20px; border-radius: 12px; font-weight: 700; font-family: var(--font-main);
+        cursor: pointer; box-shadow: var(--shadow); transition: 0.1s;
+    }
+    .btn:active { transform: translate(4px, 4px); box-shadow: none; }
+    .btn.ghost { background: var(--card); }
+    .btn.sm { padding: 6px 12px; font-size: 14px; }
+
+    /* LAYOUT */
+    main { max-width: 1000px; margin: 40px auto; padding: 0 20px; }
+    .view { display: none; }
+    .view.active { display: block; animation: fadeIn 0.3s; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+
+    /* MENU GRID */
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 20px; }
+    .card {
+        background: var(--card); border: var(--border); border-radius: 16px;
+        padding: 16px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 10px;
+    }
+    .card .emoji { font-size: 40px; background: var(--bg); border-radius: 12px; text-align: center; padding: 20px; }
+    .card h3 { font-size: 20px; }
+    .card p { color: var(--mute); font-size: 14px; flex-grow: 1; }
+    .price-row { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; }
+    .price { font-size: 20px; font-weight: 800; font-family: var(--font-title); }
+
+    /* AUTH FORMS */
+    .auth-box {
+        background: var(--card); border: var(--border); border-radius: 20px;
+        padding: 30px; max-width: 400px; margin: 0 auto; box-shadow: var(--shadow);
+    }
+    .auth-box h2 { margin-bottom: 20px; text-align: center; }
+    .form-group { margin-bottom: 15px; }
+    .form-group label { display: block; margin-bottom: 5px; font-weight: 600; font-size: 14px; }
+    .form-group input {
+        width: 100%; padding: 12px; border: var(--border); border-radius: 10px;
+        font-family: var(--font-main); font-size: 16px; outline: none;
+    }
+    .form-group input:focus { box-shadow: 2px 2px 0 var(--pri); }
+    .auth-toggle { text-align: center; margin-top: 15px; font-size: 14px; }
+    .auth-toggle a { color: var(--pri); font-weight: 700; cursor: pointer; text-decoration: none; }
+
+    /* CART */
+    .cart-panel {
+        background: var(--card); border: var(--border); border-radius: 16px;
+        padding: 20px; box-shadow: var(--shadow); position: sticky; top: 100px;
+    }
+    .cart-item { display: flex; justify-content: space-between; margin-bottom: 10px; border-bottom: 1px dashed #ccc; padding-bottom: 10px; }
+    .cart-total { font-size: 20px; font-weight: 800; text-align: right; margin: 15px 0; border-top: 2px solid #000; padding-top: 15px; }
+
+    /* TOAST */
+    #toast {
+        position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+        background: var(--accent); color: #000; padding: 12px 24px; border: var(--border);
+        border-radius: 10px; font-weight: 700; box-shadow: var(--shadow);
+        display: none; z-index: 1000;
+    }
+</style>
+</head>
+<body>
+
+<header>
+    <div class="logo">☕ Encave Café</div>
+    <nav id="nav">
+        <button class="btn ghost" onclick="showView('home')">Menu</button>
+        <button class="btn ghost" onclick="showView('cart')">Cart (<span id="cart-count">0</span>)</button>
+        <button class="btn" id="nav-auth-btn" onclick="showView('auth')">Login</button>
+    </nav>
+</header>
+
+<main>
+    <!-- HOME VIEW -->
+    <div id="view-home" class="view active">
+        <h2 style="margin-bottom: 20px; font-size: 36px;">What would you like today?</h2>
+        <div class="grid" id="menu-grid">
+            <!-- Loaded via JS -->
+        </div>
+    </div>
+
+    <!-- AUTH VIEW -->
+    <div id="view-auth" class="view">
+        <div class="auth-box" id="login-box">
+            <h2>Welcome Back</h2>
+            <div class="form-group">
+                <label>Email</label>
+                <input type="email" id="login-email" placeholder="you@example.com">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="login-password" placeholder="••••••••">
+            </div>
+            <button class="btn" style="width: 100%;" onclick="doLogin()">Log In</button>
+            <div class="auth-toggle">
+                Don't have an account? <a onclick="toggleAuth()">Sign up</a>
+            </div>
+        </div>
+
+        <div class="auth-box" id="signup-box" style="display: none;">
+            <h2>Create Account</h2>
+            <div class="form-group">
+                <label>Full Name</label>
+                <input type="text" id="signup-name" placeholder="John Doe">
+            </div>
+            <div class="form-group">
+                <label>Email</label>
+                <input type="email" id="signup-email" placeholder="you@example.com">
+            </div>
+            <div class="form-group">
+                <label>Phone</label>
+                <input type="text" id="signup-phone" placeholder="9876543210">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="signup-password" placeholder="••••••••">
+            </div>
+            <button class="btn" style="width: 100%;" onclick="doSignup()">Sign Up</button>
+            <div class="auth-toggle">
+                Already have an account? <a onclick="toggleAuth()">Log in</a>
+            </div>
+        </div>
+    </div>
+
+    <!-- CART VIEW -->
+    <div id="view-cart" class="view">
+        <div style="display: grid; grid-template-columns: 1fr 350px; gap: 20px; align-items: start;">
+            <div class="card" style="padding: 30px;">
+                <h2 style="margin-bottom: 20px;">Your Cart</h2>
+                <div id="cart-items-list"></div>
+                <div class="cart-total">Total: ₹<span id="cart-total-price">0</span></div>
+                <div class="form-group" id="guest-checkout" style="margin-top: 20px;">
+                    <label>Your Name (for the barista)</label>
+                    <input type="text" id="checkout-name" placeholder="Enter your name">
+                </div>
+                <button class="btn" style="width: 100%; font-size: 18px; padding: 15px;" onclick="checkout()">Pay Now</button>
+            </div>
+        </div>
+    </div>
+</main>
+
+<div id="toast">Notification</div>
+
+<script>
+// ==========================================
+// STATE
+// ==========================================
+let menuData = [];
+let cart = {};
+let currentUser = null;
+let currentView = 'home';
+
+// ==========================================
+// UTILS
+// ==========================================
+function showToast(msg) {
+    const t = document.getElementById('toast');
+    t.innerText = msg;
+    t.style.display = 'block';
+    setTimeout(() => t.style.display = 'none', 3000);
+}
+
+async function api(action, data = {}) {
+    try {
+        const res = await fetch(`?api=${action}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        });
+        const json = await res.json();
+        if (json.error) throw new Error(json.error);
+        return json;
+    } catch (err) {
+        showToast(err.message);
+        return null;
+    }
+}
+
+function showView(viewName) {
+    currentView = viewName;
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    document.getElementById(`view-${viewName}`).classList.add('active');
+    
+    if (viewName === 'cart') renderCart();
+    if (viewName === 'auth') toggleAuth('login'); // default to login
+}
+
+function toggleAuth(type = null) {
+    const loginBox = document.getElementById('login-box');
+    const signupBox = document.getElementById('signup-box');
+    
+    if (type === 'login') {
+        loginBox.style.display = 'block';
+        signupBox.style.display = 'none';
+    } else if (type === 'signup') {
+        loginBox.style.display = 'none';
+        signupBox.style.display = 'block';
+    } else {
+        // Toggle logic
+        if (loginBox.style.display === 'none') {
+            loginBox.style.display = 'block';
+            signupBox.style.display = 'none';
+        } else {
+            loginBox.style.display = 'none';
+            signupBox.style.display = 'block';
+        }
+    }
+}
+
+// ==========================================
+// AUTHENTICATION
+// ==========================================
+async function doSignup() {
+    const name = document.getElementById('signup-name').value;
+    const email = document.getElementById('signup-email').value;
+    const phone = document.getElementById('signup-phone').value;
+    const password = document.getElementById('signup-password').value;
+
+    const res = await api('signup', { name, email, phone, password });
+    if (res && res.success) {
+        currentUser = res.user;
+        updateNav();
+        showToast('Account created successfully!');
+        showView('home');
+    }
+}
+
+async function doLogin() {
+    const email = document.getElementById('login-email').value;
+    const password = document.getElementById('login-password').value;
+
+    const res = await api('login', { email, password });
+    if (res && res.success) {
+        currentUser = res.user;
+        updateNav();
+        showToast('Welcome back!');
+        showView('home');
+    }
+}
+
+async function doLogout() {
+    await api('logout');
+    currentUser = null;
+    updateNav();
+    showToast('Logged out');
+    showView('home');
+}
+
+function updateNav() {
+    const btn = document.getElementById('nav-auth-btn');
+    if (currentUser) {
+        btn.innerText = `👤 ${currentUser.name.split(' ')[0]}`;
+        btn.onclick = doLogout;
+        btn.title = "Click to logout";
+        document.getElementById('guest-checkout').style.display = 'none';
+    } else {
+        btn.innerText = 'Login';
+        btn.onclick = () => showView('auth');
+        document.getElementById('guest-checkout').style.display = 'block';
+    }
+}
+
+// ==========================================
+// MENU & CART
+// ==========================================
+async function loadMenu() {
+    const res = await api('menu');
+    if (res && res.items) {
+        menuData = res.items;
+        renderMenu();
+    }
+}
+
+function renderMenu() {
+    const grid = document.getElementById('menu-grid');
+    grid.innerHTML = menuData.map(item => `
+        <div class="card">
+            <div class="emoji">${item.emoji}</div>
+            <h3>${item.name}</h3>
+            <p>${item.description}</p>
+            <div class="price-row">
+                <span class="price">₹${item.price}</span>
+                <button class="btn sm" onclick="addToCart(${item.id})">Add</button>
+            </div>
+        </div>
+    `).join('');
+}
+
+function addToCart(id) {
+    const item = menuData.find(i => i.id == id);
+    if (!cart[id]) cart[id] = { ...item, qty: 0 };
+    cart[id].qty++;
+    updateCartCount();
+    showToast(`${item.name} added to cart`);
+}
+
+function updateCartCount() {
+    const count = Object.values(cart).reduce((sum, item) => sum + item.qty, 0);
+    document.getElementById('cart-count').innerText = count;
+}
+
+function renderCart() {
+    const list = document.getElementById('cart-items-list');
+    const items = Object.values(cart);
+    
+    if (items.length === 0) {
+        list.innerHTML = `<p style="color: var(--mute)">Your cart is empty.</p>`;
+        document.getElementById('cart-total-price').innerText = '0';
+        return;
+    }
+
+    list.innerHTML = items.map(item => `
+        <div class="cart-item">
+            <div>
+                <strong>${item.name}</strong><br>
+                <span style="font-size: 14px; color: var(--mute);">₹${item.price} x ${item.qty}</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px;">
+                <button class="btn sm ghost" onclick="changeQty(${item.id}, -1)">-</button>
+                <span>${item.qty}</span>
+                <button class="btn sm ghost" onclick="changeQty(${item.id}, 1)">+</button>
+            </div>
+        </div>
+    `).join('');
+
+    const total = items.reduce((sum, item) => sum + (item.price * item.qty), 0);
+    document.getElementById('cart-total-price').innerText = total;
+}
+
+function changeQty(id, delta) {
+    if (!cart[id]) return;
+    cart[id].qty += delta;
+    if (cart[id].qty <= 0) delete cart[id];
+    updateCartCount();
+    renderCart();
+}
+
+async function checkout() {
+    const items = Object.values(cart);
+    if (items.length === 0) return showToast('Cart is empty');
+    
+    let guestName = 'Guest';
+    if (!currentUser) {
+        guestName = document.getElementById('checkout-name').value.trim();
+        if (!guestName) return showToast('Please enter your name');
+    }
+
+    const total = items.reduce((sum, item) => sum + (item.price * item.qty), 0);
+    const btn = document.querySelector('#view-cart .btn');
+    btn.innerText = 'Processing...';
+    btn.disabled = true;
+
+    const res = await api('checkout', { cart: items, total, guest_name: guestName });
+    
+    btn.innerText = 'Pay Now';
+    btn.disabled = false;
+
+    if (res && res.success) {
+        alert(`Order Placed Successfully!\n\nYour Order ID is: ${res.order_code}\n\nShow this ID at the counter.`);
+        cart = {};
+        updateCartCount();
+        showView('home');
+    }
+}
+
+// ==========================================
+// INIT
+// ==========================================
+async function init() {
+    const res = await api('me');
+    if (res && res.user) {
+        currentUser = res.user;
+        updateNav();
+    }
+    await loadMenu();
+}
+
+init();
+</script>
+</body>
+</html>
