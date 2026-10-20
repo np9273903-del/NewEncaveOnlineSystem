@@ -7,13 +7,17 @@ USE `encave_nikhil`;
 
 -- ---------- USERS ----------
 CREATE TABLE IF NOT EXISTS `users` (
-  `id`         INT AUTO_INCREMENT PRIMARY KEY,
-  `name`       VARCHAR(100) NOT NULL,
-  `email`      VARCHAR(100) NOT NULL UNIQUE,
-  `phone`      VARCHAR(20)  NOT NULL,
-  `password`   VARCHAR(255) NOT NULL,
-  `is_admin`   TINYINT(1)   DEFAULT 0,
-  `created_at` TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+  `id`                     INT AUTO_INCREMENT PRIMARY KEY,
+  `name`                   VARCHAR(100) NOT NULL,
+  `email`                  VARCHAR(100) NOT NULL UNIQUE,
+  `phone`                  VARCHAR(20)  NOT NULL,
+  `password`               VARCHAR(255) NOT NULL,
+  `is_admin`               TINYINT(1)   DEFAULT 0,
+  `reset_token_hash`       VARCHAR(64)  DEFAULT NULL,
+  `reset_token_expires_at` DATETIME     DEFAULT NULL,
+  `reset_otp`              VARCHAR(10)  DEFAULT NULL,
+  `reset_otp_expires_at`   DATETIME     DEFAULT NULL,
+  `created_at`             TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
 );
 
 -- ---------- MENU ----------
@@ -30,14 +34,18 @@ CREATE TABLE IF NOT EXISTS `menu` (
 
 -- ---------- ORDERS ----------
 CREATE TABLE IF NOT EXISTS `orders` (
-  `id`         INT AUTO_INCREMENT PRIMARY KEY,
-  `order_code` VARCHAR(20)   NOT NULL UNIQUE,
-  `user_id`    INT           DEFAULT NULL,
-  `guest_name` VARCHAR(100)  DEFAULT NULL,
-  `items_json` TEXT          NOT NULL,
-  `total`      DECIMAL(10,2) NOT NULL,
-  `status`     VARCHAR(20)   DEFAULT 'Pending',
-  `created_at` TIMESTAMP     DEFAULT CURRENT_TIMESTAMP
+  `id`                INT AUTO_INCREMENT PRIMARY KEY,
+  `order_code`        VARCHAR(20)   NOT NULL UNIQUE,
+  `user_id`           INT           DEFAULT NULL,
+  `guest_name`        VARCHAR(100)  DEFAULT NULL,
+  `items_json`        TEXT          NOT NULL,
+  `total`             DECIMAL(10,2) NOT NULL,
+  `status`            VARCHAR(20)   DEFAULT 'Pending',
+  `payment_method`    VARCHAR(30)   DEFAULT 'Cash at Counter',
+  `payment_id`        VARCHAR(100)  DEFAULT NULL,
+  `razorpay_order_id` VARCHAR(100)  DEFAULT NULL,
+  `payment_status`    VARCHAR(50)   DEFAULT 'Pending',
+  `created_at`        TIMESTAMP     DEFAULT CURRENT_TIMESTAMP
 );
 
 -- ---------- SEED MENU ----------
